@@ -1,0 +1,1 @@
+python train.py --config-name train_dexgraspvla_controller_workspace

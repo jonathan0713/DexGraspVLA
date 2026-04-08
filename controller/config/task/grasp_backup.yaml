@@ -1,13 +1,12 @@
 name: grasp
 
-image_shape: [3, 224, 224]
-mask_image_shape: [4, 224, 224]
+image_shape: [3, 518, 518]
+mask_image_shape: [4, 518, 518]
 dataset_paths:
-  - data/grasp_demo_example # 或您的絕對路徑
+ - data/grasp_demo_example
 
 shape_meta: &shape_meta
   obs:
-    # --- 原有設定 ---
     right_cam_img:
       shape: ${task.image_shape}
       type: rgb
@@ -20,20 +19,6 @@ shape_meta: &shape_meta
       shape: [13]
       type: low_dim
       horizon: ${n_obs_steps}
-      
-    # --- 【新增】 額外兩個視角 ---
-    # 1. 輔助視角 (Side Cam 2) - 帶 Mask
-    rgbm_aux:
-      shape: ${task.mask_image_shape}
-      type: rgbm
-      horizon: ${n_obs_steps}
-    
-    # 2. 全域視角 (Global Cam) - 純 RGB
-    aux_cam_img:
-      shape: ${task.image_shape}
-      type: rgb
-      horizon: ${n_obs_steps}
-
   action:
     shape: [13]
     horizon: ${n_action_steps}
