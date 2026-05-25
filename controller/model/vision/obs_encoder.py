@@ -122,9 +122,11 @@ class ObsEncoder(ModuleAttrMixin):
             nn.LayerNorm(feature_dim)
         )
 
+        state_dim = int(shape_meta['obs']['right_state']['shape'][0])
+
         # Create state_net to process robot arm and dexterous hand states
         self.state_net = nn.Sequential(
-            nn.Linear(13, 256),
+            nn.Linear(state_dim, 256),
             nn.LayerNorm(256),
             nn.GELU(),
             nn.Dropout(0.1),
@@ -134,6 +136,7 @@ class ObsEncoder(ModuleAttrMixin):
 
         self.shape_meta = shape_meta
         self.feature_dim = feature_dim
+        self.state_dim = state_dim
 
         logger.info(
             "Number of parameters in obs encoder: %e", sum(p.numel() for p in self.parameters())
@@ -185,7 +188,11 @@ class ObsEncoder(ModuleAttrMixin):
         return wrist_feature
         
     def forward_state(self, state_data):
-        # state_data: B,T,13
+        # state_data: B,T,state_dim
+        if state_data.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"Expected right_state dim {self.state_dim}, got {state_data.shape[-1]}"
+            )
         B, T = state_data.shape[:2]
         state_data = state_data.reshape(B*T, -1)
         state_feature = self.state_net(state_data)  # (B*T, feature_dim)
@@ -198,7 +205,7 @@ class ObsEncoder(ModuleAttrMixin):
         obs_dict = {
             'rgbm': (B,T,4,H,W),      # Head camera RGBM image
             'right_cam_img': (B,T,3,H,W), # Wrist camera RGB image  
-            'right_state': (B,T,13)    # Robot arm state
+            'right_state': (B,T,state_dim)    # Robot arm state
         }
         Output:
         embeddings: (B,T*(num_patches*2+1),feature_dim) # Concatenate all features along sequence length dimension

@@ -3,12 +3,7 @@ name: grasp
 image_shape: [3, 518, 518]
 mask_image_shape: [4, 518, 518]
 dataset_paths:
-#  - data/grasp_demo_example
-#  - /home/jonathan/local_data/0423_blackcola_zarr_with_masks_preprocessed
-#  - /home/jonathan/local_data/0423_goldencola_zarr_with_masks_preprocessed
- - /home/jonathan/local_data/mycobot_f100_dataset/black_with_masks_preprocessed
- - /home/jonathan/local_data/mycobot_f100_dataset/purple_with_masks_preprocessed
- - /home/jonathan/local_data/mycobot_f100_dataset/red_with_masks_preprocessed
+ - data/grasp_demo_example
 
 shape_meta: &shape_meta
   obs:
@@ -21,11 +16,11 @@ shape_meta: &shape_meta
       type: rgbm
       horizon: ${n_obs_steps}
     right_state:
-      shape: [8]
+      shape: [13]
       type: low_dim
       horizon: ${n_obs_steps}
   action:
-    shape: [8]
+    shape: [13]
     horizon: ${n_action_steps}
 
 env_runner:
@@ -34,7 +29,6 @@ env_runner:
 dataset:
   _target_: controller.dataset.mask_image_dataset.MaskImageDataset
   zarr_paths: ${task.dataset_paths}
-  # shape_meta: ${shape_meta}
   horizon: ${n_action_steps}
   pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
   pad_after: ${eval:'${n_action_steps}-1'}

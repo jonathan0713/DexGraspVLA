@@ -251,7 +251,7 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
 
                 # run validation
                 if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0:
-                    with torch.no_grad():
+                    with torch.no_grad(), accelerator.autocast():
                         val_losses = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec, 
@@ -281,7 +281,7 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                     step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action)
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
-                    with torch.no_grad():
+                    with torch.no_grad(), accelerator.autocast():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         gt_action = batch['action']
