@@ -96,6 +96,7 @@ class MaskImageDataset(BaseImageDataset):
 
         target_poses = replay_buffer.meta.get('target_poses', None)
         if target_poses is None:
+            print(f"[GoalCond] Missing meta/target_poses in {replay_buffer.zarr_path}; using zeros.")
             return goals
 
         if len(target_poses) != n_episodes:
