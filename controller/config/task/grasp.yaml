@@ -40,3 +40,4 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
   val_ratio: 0
+  use_pregrasp_delta_aux: ${policy.use_pregrasp_delta_aux}

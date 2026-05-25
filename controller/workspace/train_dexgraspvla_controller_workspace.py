@@ -47,6 +47,10 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
         # configure model
         self.model: DexGraspVLAController
         self.model = hydra.utils.instantiate(cfg.policy)
+        
+        # Set auxiliary loss weight
+        if hasattr(cfg.training, 'lambda_pregrasp_delta_aux'):
+            self.model._lambda_pregrasp_delta_aux = cfg.training.lambda_pregrasp_delta_aux
 
         self.ema_model: DexGraspVLAController = None
         if cfg.training.use_ema:

@@ -33,6 +33,9 @@ class DexGraspVLAController(BaseImagePolicy):
             p_drop_attn=0.1,
             use_attn_mask=False,
             start_ckpt_path=None,
+            # auxiliary loss
+            use_pregrasp_delta_aux=False,
+            pregrasp_delta_aux_hidden_dim=256,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -68,6 +71,18 @@ class DexGraspVLAController(BaseImagePolicy):
         self.action_horizon = action_horizon
         self.start_ckpt_path = start_ckpt_path
         self.kwargs = kwargs
+        
+        # Pre-grasp auxiliary loss setup
+        self.use_pregrasp_delta_aux = use_pregrasp_delta_aux
+        if use_pregrasp_delta_aux:
+            # Auxiliary head: pool observation features -> predict delta arm joints
+            self.pregrasp_delta_aux_head = torch.nn.Sequential(
+                torch.nn.Linear(n_emb, pregrasp_delta_aux_hidden_dim),
+                torch.nn.LayerNorm(pregrasp_delta_aux_hidden_dim),
+                torch.nn.GELU(),
+                torch.nn.Dropout(0.1),
+                torch.nn.Linear(pregrasp_delta_aux_hidden_dim, 6)
+            )
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -228,7 +243,50 @@ class DexGraspVLAController(BaseImagePolicy):
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
         loss = F.mse_loss(pred, target)
-
+        
+        # Compute auxiliary pre-grasp delta-arm loss if enabled
+        aux_loss = None
+        if self.use_pregrasp_delta_aux and training:
+            # Get auxiliary targets from batch
+            if 'target_arm_joints' in batch and 'pregrasp_mask' in batch:
+                B = obs_tokens.shape[0]
+                device = obs_tokens.device
+                
+                # Pool observation features: mean over tokens
+                obs_summary = torch.mean(obs_tokens, dim=1)  # [B, n_emb]
+                
+                # Predict delta arm joints
+                pred_delta_arm = self.pregrasp_delta_aux_head(obs_summary)  # [B, 6]
+                
+                # Get current arm joints from state
+                current_arm_joints = batch['obs']['right_state'][:, 0, :6]  # [B, 6]
+                
+                # Get target arm joints
+                target_arm_joints = batch['target_arm_joints'].to(device)  # [B, 6]
+                
+                # Compute delta arm to grasp
+                delta_arm_to_grasp = target_arm_joints - current_arm_joints  # [B, 6]
+                
+                # Get pregrasp mask
+                pregrasp_mask = batch['pregrasp_mask'].to(device)  # [B] or [B, 1]
+                if pregrasp_mask.dim() > 1:
+                    pregrasp_mask = pregrasp_mask.squeeze(-1)  # [B]
+                
+                # Compute per-sample MSE
+                mse_per_sample = torch.mean(
+                    (pred_delta_arm - delta_arm_to_grasp) ** 2, 
+                    dim=-1
+                )  # [B]
+                
+                # Apply mask with stable normalization
+                mask_sum = torch.sum(pregrasp_mask)
+                eps = 1e-6
+                aux_loss = torch.sum(pregrasp_mask * mse_per_sample) / (mask_sum + eps)
+                
+                # Combine with action loss
+                lambda_pregrasp_delta_aux = getattr(self, '_lambda_pregrasp_delta_aux', 0.02)
+                loss = loss + lambda_pregrasp_delta_aux * aux_loss
+        
         return loss
 
     def forward(self, batch, training=True):
