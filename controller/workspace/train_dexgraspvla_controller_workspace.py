@@ -49,8 +49,8 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
         self.model = hydra.utils.instantiate(cfg.policy)
         
         # Set auxiliary loss weight
-        if hasattr(cfg.training, 'lambda_pregrasp_delta_aux'):
-            self.model._lambda_pregrasp_delta_aux = cfg.training.lambda_pregrasp_delta_aux
+        if hasattr(cfg.training, 'lambda_grasp_xy_aux'):
+            self.model._lambda_grasp_xy_aux = cfg.training.lambda_grasp_xy_aux
 
         self.ema_model: DexGraspVLAController = None
         if cfg.training.use_ema:
@@ -181,6 +181,7 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
+                accelerator.unwrap_model(self.model)._current_epoch = self.epoch
                 self.model.train()
 
                 step_log = dict()

@@ -7,7 +7,7 @@ from controller.common.pytorch_util import dict_apply
 from controller.common.streaming_replay_buffer import StreamingReplayBuffer
 from controller.common.sampler import (
     SequenceSampler, get_val_mask, downsample_mask)
-from controller.model.common.normalizer import LinearNormalizer
+from controller.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from controller.dataset.base_dataset import BaseImageDataset
 import torch.nn.functional as F
 
@@ -22,12 +22,19 @@ class MaskImageDataset(BaseImageDataset):
             val_ratio=0.0,
             max_train_episodes=None,
             image_size=(518, 518),
+            use_grasp_xy_aux=False,
             use_pregrasp_delta_aux=False
             ):
         
         super().__init__()
         self.image_size = image_size
-        self.use_pregrasp_delta_aux = use_pregrasp_delta_aux
+        self.use_grasp_xy_aux = use_grasp_xy_aux
+        self.use_pregrasp_delta_aux = False
+        if use_pregrasp_delta_aux:
+            print(
+                "Warning: use_pregrasp_delta_aux is deprecated and ignored. "
+                "target_pose['arm_joints'] is not used."
+            )
         
         # Initialize storage lists
         self.replay_buffers = []
@@ -36,8 +43,7 @@ class MaskImageDataset(BaseImageDataset):
         self.sampler_lens = []
         
         # Initialize auxiliary loss data structures
-        self.target_arm_joints_per_episode = []  # List of dicts indexed by zarr_idx and episode_idx
-        self.pregrasp_masks = []  # List of arrays indexed by zarr_idx, containing pregrasp masks for all frames
+        self.target_grasp_xy_per_episode = []  # List of dicts indexed by zarr_idx and episode_idx
         self.frame_to_episode = []  # List of arrays indexed by zarr_idx, mapping frame idx to episode idx
         self.sampler_to_episode_map = []  # Maps sampler idx to (zarr_idx, episode_idx)
         
@@ -82,26 +88,33 @@ class MaskImageDataset(BaseImageDataset):
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
         
+    def _decode_target_pose(self, target_pose):
+        if isinstance(target_pose, np.ndarray) and target_pose.shape == ():
+            target_pose = target_pose.item()
+        if isinstance(target_pose, bytes):
+            target_pose = target_pose.decode("utf-8")
+        if isinstance(target_pose, str):
+            target_pose = json.loads(target_pose)
+        return target_pose
+
     def _process_target_poses_for_zarr(self, replay_buffer, zarr_idx):
         """
-        Load target poses from meta and build pregrasp masks.
+        Load target poses from meta and extract privileged grasp XY targets.
         """
         target_poses = replay_buffer.meta.get('target_poses', None)
         episode_ends = replay_buffer.episode_ends
         
         # Initialize storage for this zarr
-        target_arm_joints_dict = {}
-        pregrasp_mask = np.zeros(len(replay_buffer), dtype=np.float32)
+        target_grasp_xy_dict = {}
         frame_to_episode = np.zeros(len(replay_buffer), dtype=np.int32)
         
         if target_poses is None or len(target_poses) == 0:
             # No target poses available
-            self.target_arm_joints_per_episode.append(target_arm_joints_dict)
-            self.pregrasp_masks.append(pregrasp_mask)
+            self.target_grasp_xy_per_episode.append(target_grasp_xy_dict)
             self.frame_to_episode.append(frame_to_episode)
             return
         
-        # Build frame_to_episode mapping and extract target arm joints
+        # Build frame_to_episode mapping and extract target grasp XY.
         episode_starts = np.concatenate([[0], episode_ends[:-1]])
         
         for episode_idx in range(len(episode_ends)):
@@ -111,73 +124,22 @@ class MaskImageDataset(BaseImageDataset):
             # Map frames to episode
             frame_to_episode[episode_start:episode_end] = episode_idx
             
-            # Extract target arm joints from this episode's target pose
+            # Extract target grasp XY from this episode's target pose.
             if episode_idx < len(target_poses):
                 target_pose = target_poses[episode_idx]
                 try:
-                    # Handle both string and dict format
-                    if isinstance(target_pose, str):
-                        target_pose = json.loads(target_pose)
-                    
-                    # Extract arm_joints
-                    if isinstance(target_pose, dict) and 'arm_joints' in target_pose:
-                        arm_joints = target_pose['arm_joints']
-                        if isinstance(arm_joints, (list, np.ndarray)):
-                            arm_joints = np.array(arm_joints[:6], dtype=np.float32)
-                            target_arm_joints_dict[episode_idx] = arm_joints
+                    target_pose = self._decode_target_pose(target_pose)
+
+                    if isinstance(target_pose, dict) and 'cartesian_pose_xyzw' in target_pose:
+                        cartesian_pose = target_pose['cartesian_pose_xyzw']
+                        if isinstance(cartesian_pose, (list, tuple, np.ndarray)) and len(cartesian_pose) >= 2:
+                            grasp_xy = np.array(cartesian_pose[:2], dtype=np.float32)
+                            target_grasp_xy_dict[episode_idx] = grasp_xy
                 except Exception as e:
                     print(f"Warning: Failed to parse target_pose for episode {episode_idx}: {e}")
                     continue
         
-        # Compute pregrasp masks based on distance to target arm joints
-        if self.use_pregrasp_delta_aux:
-            right_state = replay_buffer['right_state']  # [T, 8]
-            
-            print(f"\n=== Pregrasp Mask Sanity Check for zarr_idx={zarr_idx} ===")
-            for episode_idx in range(len(episode_ends)):
-                if episode_idx not in target_arm_joints_dict:
-                    continue
-                
-                episode_start = episode_starts[episode_idx]
-                episode_end = episode_ends[episode_idx]
-                episode_length = episode_end - episode_start
-                
-                target_joints = target_arm_joints_dict[episode_idx]  # [6]
-                episode_right_state = right_state[episode_start:episode_end]  # [T, 8]
-                episode_arm_joints = episode_right_state[:, :6]  # [T, 6]
-                
-                # Compute distance to target for each frame
-                distances = np.linalg.norm(
-                    episode_arm_joints - target_joints[np.newaxis, :],  # broadcast to [T, 6]
-                    axis=1
-                )  # [T]
-                
-                # Find closest frame to target
-                t_grasp = np.argmin(distances)
-                min_dist = distances[t_grasp]
-                
-                # Mark frames <= t_grasp as pregrasp
-                pregrasp_mask[episode_start:episode_start+t_grasp+1] = 1.0
-                
-                # Log sanity check
-                pregrasp_ratio = (t_grasp + 1) / episode_length
-                print(
-                    f"  Episode {episode_idx}: length={episode_length}, "
-                    f"t_grasp={t_grasp}, "
-                    f"pregrasp_ratio={pregrasp_ratio:.2%}, "
-                    f"min_distance_to_target={min_dist:.6f}"
-                )
-                
-                # Warn if t_grasp seems suspicious
-                if t_grasp == 0:
-                    print(f"    ⚠️  WARNING: t_grasp=0 (first frame is closest)")
-                if pregrasp_ratio > 0.9:
-                    print(f"    ⚠️  WARNING: pregrasp phase is >90% of episode (may include lift)")
-                if pregrasp_ratio < 0.05:
-                    print(f"    ⚠️  WARNING: pregrasp phase is <5% of episode (may be too restrictive)")
-        
-        self.target_arm_joints_per_episode.append(target_arm_joints_dict)
-        self.pregrasp_masks.append(pregrasp_mask)
+        self.target_grasp_xy_per_episode.append(target_grasp_xy_dict)
         self.frame_to_episode.append(frame_to_episode)
 
     def get_validation_dataset(self):
@@ -271,25 +233,24 @@ class MaskImageDataset(BaseImageDataset):
             'action': sample['action'].astype(np.float32)
         }
         
-        # Add auxiliary targets
-        if self.use_pregrasp_delta_aux:
+        # Add training-only auxiliary grasp workspace target.
+        if self.use_grasp_xy_aux:
             # Get episode index for this frame
             episode_idx = int(self.frame_to_episode[zarr_idx][frame_idx])
             
-            # Get target arm joints and pregrasp mask for this frame
-            target_arm_joints_dict = self.target_arm_joints_per_episode[zarr_idx]
-            pregrasp_mask = self.pregrasp_masks[zarr_idx]
+            # Get target grasp XY for this episode.
+            target_grasp_xy_dict = self.target_grasp_xy_per_episode[zarr_idx]
             
-            if episode_idx in target_arm_joints_dict:
-                target_arm_joints = target_arm_joints_dict[episode_idx].astype(np.float32)
-                pregrasp_mask_value = float(pregrasp_mask[frame_idx])
+            if episode_idx in target_grasp_xy_dict:
+                grasp_xy = target_grasp_xy_dict[episode_idx].astype(np.float32)
+                grasp_xy_valid = 1.0
             else:
                 # No target pose for this episode
-                target_arm_joints = np.zeros(6, dtype=np.float32)
-                pregrasp_mask_value = 0.0
+                grasp_xy = np.zeros(2, dtype=np.float32)
+                grasp_xy_valid = 0.0
             
-            data['target_arm_joints'] = target_arm_joints
-            data['pregrasp_mask'] = np.array(pregrasp_mask_value, dtype=np.float32)
+            data['grasp_xy'] = grasp_xy
+            data['grasp_xy_valid'] = np.array(grasp_xy_valid, dtype=np.float32)
         
         return data
 
@@ -308,6 +269,41 @@ class MaskImageDataset(BaseImageDataset):
         
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+
+        if self.use_grasp_xy_aux:
+            grasp_xy = []
+            for zarr_idx, train_mask in enumerate(self.train_masks):
+                target_grasp_xy_dict = self.target_grasp_xy_per_episode[zarr_idx]
+                train_episode_idxs = np.nonzero(train_mask)[0]
+                for episode_idx in train_episode_idxs:
+                    if int(episode_idx) in target_grasp_xy_dict:
+                        grasp_xy.append(target_grasp_xy_dict[int(episode_idx)])
+
+            if len(grasp_xy) == 0:
+                print(
+                    "Warning: use_grasp_xy_aux=True but no valid "
+                    "target_pose['cartesian_pose_xyzw'] values were found in train episodes."
+                )
+                grasp_xy = np.zeros((1, 2), dtype=np.float32)
+            else:
+                grasp_xy = np.stack(grasp_xy, axis=0).astype(np.float32)
+
+            mean = torch.from_numpy(grasp_xy.mean(axis=0)).float()
+            std = torch.from_numpy(grasp_xy.std(axis=0)).float()
+            std = torch.where(std < 1e-6, torch.ones_like(std), std)
+            scale = 1.0 / std
+            offset = -mean * scale
+            input_stats_dict = {
+                'min': torch.from_numpy(grasp_xy.min(axis=0)).float(),
+                'max': torch.from_numpy(grasp_xy.max(axis=0)).float(),
+                'mean': mean,
+                'std': std
+            }
+            normalizer['grasp_xy'] = SingleFieldLinearNormalizer.create_manual(
+                scale=scale,
+                offset=offset,
+                input_stats_dict=input_stats_dict
+            )
         return normalizer
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
