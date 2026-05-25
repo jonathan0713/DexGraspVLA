@@ -195,7 +195,11 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                         train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model(batch, training=True)
+                        raw_loss = self.model(
+                            batch,
+                            training=True,
+                            goal_cond=batch.get('goal_cond', None),
+                        )
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         accelerator.backward(loss)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
@@ -258,7 +262,11 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                                 disable=not accelerator.is_main_process) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model(batch, training=False)
+                                loss = self.model(
+                                    batch,
+                                    training=False,
+                                    goal_cond=batch.get('goal_cond', None),
+                                )
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
@@ -291,7 +299,11 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                             output_path = os.path.join(train_sample_attn_maps_dir, f'{self.epoch}.pkl')
                         else:
                             output_path = None
-                        pred_action = policy.predict_action(batch['obs'], output_path)
+                        pred_action = policy.predict_action(
+                            batch['obs'],
+                            output_path,
+                            goal_cond=batch.get('goal_cond', None),
+                        )
                         log_action_mse(step_log, 'train', pred_action, gt_action)
 
                         if len(val_dataloader) > 0:
@@ -304,7 +316,11 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                                 output_path = os.path.join(val_sample_attn_maps_dir, f'{self.epoch}.pkl')
                             else:
                                 output_path = None
-                            pred_action = policy.predict_action(batch['obs'], output_path)
+                            pred_action = policy.predict_action(
+                                batch['obs'],
+                                output_path,
+                                goal_cond=batch.get('goal_cond', None),
+                            )
                             log_action_mse(step_log, 'val', pred_action, gt_action)
 
                         del batch

@@ -2,6 +2,7 @@ from typing import Dict
 import torch
 import numpy as np
 import copy
+import json
 from controller.common.pytorch_util import dict_apply
 from controller.common.streaming_replay_buffer import StreamingReplayBuffer
 from controller.common.sampler import (
@@ -20,7 +21,9 @@ class MaskImageDataset(BaseImageDataset):
             seed=42,
             val_ratio=0.0,
             max_train_episodes=None,
-            image_size=(518, 518)
+            image_size=(518, 518),
+            goal_dim=7,
+            goal_mode='joint',
             ):
         
         super().__init__()
@@ -31,6 +34,10 @@ class MaskImageDataset(BaseImageDataset):
         self.train_masks = []
         self.samplers = []
         self.sampler_lens = []
+        self.goal_conds = []
+        self.frame_to_episodes = []
+        self.goal_dim = int(goal_dim)
+        self.goal_mode = goal_mode
         
         # Process each zarr file
         for zarr_path in zarr_paths:
@@ -38,6 +45,8 @@ class MaskImageDataset(BaseImageDataset):
             replay_buffer = StreamingReplayBuffer.copy_from_path(
                 zarr_path, keys=['right_cam_img', 'rgbm', 'right_state', 'action'])
             self.replay_buffers.append(replay_buffer)
+            self.goal_conds.append(self._parse_episode_goal_conds(replay_buffer))
+            self.frame_to_episodes.append(self._build_frame_to_episode(replay_buffer.episode_ends))
             
             # Create train mask
             val_mask = get_val_mask(
@@ -68,6 +77,68 @@ class MaskImageDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
+
+    def _build_frame_to_episode(self, episode_ends):
+        episode_ends = np.asarray(episode_ends, dtype=np.int64)
+        total_frames = int(episode_ends[-1]) if len(episode_ends) > 0 else 0
+        frame_to_episode = np.zeros(total_frames, dtype=np.int64)
+
+        start = 0
+        for episode_idx, end in enumerate(episode_ends):
+            frame_to_episode[start:int(end)] = episode_idx
+            start = int(end)
+        return frame_to_episode
+
+    def _parse_episode_goal_conds(self, replay_buffer):
+        episode_ends = np.asarray(replay_buffer.episode_ends, dtype=np.int64)
+        n_episodes = len(episode_ends)
+        goals = np.zeros((n_episodes, self.goal_dim), dtype=np.float32)
+
+        target_poses = replay_buffer.meta.get('target_poses', None)
+        if target_poses is None:
+            return goals
+
+        if len(target_poses) != n_episodes:
+            raise ValueError(
+                f"meta/target_poses length {len(target_poses)} does not match "
+                f"episode_ends length {n_episodes} in {replay_buffer.zarr_path}"
+            )
+
+        for episode_idx, raw_target_pose in enumerate(target_poses):
+            goals[episode_idx] = self._target_pose_to_goal_cond(raw_target_pose)
+        return goals
+
+    def _target_pose_to_goal_cond(self, raw_target_pose):
+        if isinstance(raw_target_pose, bytes):
+            raw_target_pose = raw_target_pose.decode('utf-8')
+
+        if isinstance(raw_target_pose, str):
+            if raw_target_pose.strip() == "":
+                return np.zeros((self.goal_dim,), dtype=np.float32)
+            target_pose = json.loads(raw_target_pose)
+        elif isinstance(raw_target_pose, np.ndarray) and raw_target_pose.shape == ():
+            return self._target_pose_to_goal_cond(raw_target_pose.item())
+        else:
+            target_pose = raw_target_pose
+
+        if not isinstance(target_pose, dict) or len(target_pose) == 0:
+            return np.zeros((self.goal_dim,), dtype=np.float32)
+
+        if self.goal_mode != 'joint':
+            raise NotImplementedError(f"Unsupported goal_mode: {self.goal_mode}")
+
+        arm_joints = target_pose.get('arm_joints', [])
+        gripper_joints = target_pose.get('gripper_joints', [])
+        assert len(arm_joints) == 6, f"Expected 6 arm_joints, got {len(arm_joints)}"
+        assert len(gripper_joints) == 1, (
+            f"Expected 1 gripper_joints value, got {len(gripper_joints)}"
+        )
+
+        goal_cond = np.asarray(list(arm_joints) + list(gripper_joints), dtype=np.float32)
+        assert goal_cond.shape == (self.goal_dim,), (
+            f"Expected goal_cond shape {(self.goal_dim,)}, got {goal_cond.shape}"
+        )
+        return goal_cond
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -135,7 +206,7 @@ class MaskImageDataset(BaseImageDataset):
 
         return rgb.numpy()
     
-    def _sample_to_data(self, sample):
+    def _sample_to_data(self, sample, goal_cond=None):
         right_state = sample['right_state'].astype(np.float32)
         T_slice = slice(self.n_obs_steps)
 
@@ -151,6 +222,12 @@ class MaskImageDataset(BaseImageDataset):
             },
             'action': sample['action'].astype(np.float32)
         }
+        if goal_cond is not None:
+            goal_cond = np.asarray(goal_cond, dtype=np.float32)
+            assert goal_cond.shape == (self.goal_dim,), (
+                f"Expected goal_cond shape {(self.goal_dim,)}, got {goal_cond.shape}"
+            )
+            data['goal_cond'] = goal_cond
         return data
 
     def get_normalizer(self, mode='limits', **kwargs):
@@ -176,10 +253,13 @@ class MaskImageDataset(BaseImageDataset):
         for i, length in enumerate(self.sampler_lens):
             if curr_idx < length:
                 sample = self.samplers[i].sample_sequence(curr_idx)
+                buffer_start_idx = int(self.samplers[i].indices[curr_idx][0])
+                episode_idx = int(self.frame_to_episodes[i][buffer_start_idx])
+                goal_cond = self.goal_conds[i][episode_idx]
                 break
             curr_idx -= length
             
-        data = self._sample_to_data(sample)
+        data = self._sample_to_data(sample, goal_cond=goal_cond)
         torch_data = dict_apply(data, torch.from_numpy)
         return torch_data
 

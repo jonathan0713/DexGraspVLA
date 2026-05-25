@@ -1,5 +1,6 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
@@ -33,6 +34,10 @@ class DexGraspVLAController(BaseImagePolicy):
             p_drop_attn=0.1,
             use_attn_mask=False,
             start_ckpt_path=None,
+            use_goal_token=False,
+            goal_dim=7,
+            goal_token_dim=None,
+            goal_mlp_hidden_dim=None,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -46,6 +51,29 @@ class DexGraspVLAController(BaseImagePolicy):
         obs_shape, obs_part_length = obs_encoder.output_shape()
         n_emb = obs_shape[-1]
         obs_tokens = obs_shape[-2]
+        self.use_goal_token = bool(use_goal_token)
+        self.goal_dim = int(goal_dim)
+        self.goal_token_dim = n_emb if goal_token_dim is None else int(goal_token_dim)
+        self.goal_mlp_hidden_dim = (
+            n_emb if goal_mlp_hidden_dim is None else int(goal_mlp_hidden_dim)
+        )
+
+        if self.use_goal_token:
+            assert self.goal_token_dim == n_emb, (
+                f"goal_token_dim must match policy token dim {n_emb}, "
+                f"got {self.goal_token_dim}"
+            )
+            self.goal_encoder = nn.Sequential(
+                nn.Linear(self.goal_dim, self.goal_mlp_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.goal_mlp_hidden_dim, self.goal_token_dim),
+            )
+            self.null_goal_token = nn.Parameter(torch.zeros(1, 1, self.goal_token_dim))
+        else:
+            self.goal_encoder = None
+            self.null_goal_token = None
+
+        goal_token_count = 1 if self.use_goal_token else 0
         
         model = TransformerForActionDiffusion(
             input_dim=action_dim,
@@ -54,7 +82,7 @@ class DexGraspVLAController(BaseImagePolicy):
             n_layer=n_layer,
             n_head=n_head,
             n_emb=n_emb,
-            max_cond_tokens=obs_tokens+1, # obs tokens + 1 token for time
+            max_cond_tokens=obs_tokens+goal_token_count+1, # obs/goal tokens + 1 token for time
             p_drop_attn=p_drop_attn,
             obs_part_length=obs_part_length,
             use_attn_mask=use_attn_mask
@@ -72,6 +100,43 @@ class DexGraspVLAController(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+    def validate_goal_cond_shape(
+            self,
+            goal_cond: Optional[torch.Tensor],
+            batch_size: int,
+        ) -> None:
+        if goal_cond is None:
+            return
+        assert goal_cond.shape == (batch_size, self.goal_dim), (
+            f"Expected batched goal_cond shape {(batch_size, self.goal_dim)}, "
+            f"got {goal_cond.shape}"
+        )
+
+    def append_goal_token(
+            self,
+            tokens: torch.Tensor,
+            goal_cond: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+        if not self.use_goal_token:
+            return tokens
+
+        B = tokens.shape[0]
+        if goal_cond is None:
+            goal_token = self.null_goal_token.expand(B, -1, -1)
+        else:
+            if goal_cond.ndim != 2:
+                raise ValueError(f"goal_cond must have shape [B, D], got {goal_cond.shape}")
+            if goal_cond.shape != (B, self.goal_dim):
+                raise ValueError(
+                    f"goal_cond must have shape {(B, self.goal_dim)}, got {goal_cond.shape}"
+                )
+            goal_cond = goal_cond.to(device=tokens.device, dtype=tokens.dtype)
+            goal_token = self.goal_encoder(goal_cond).unsqueeze(1)
+
+        goal_token = goal_token.to(device=tokens.device, dtype=tokens.dtype)
+        assert goal_token.shape == (B, 1, tokens.shape[-1])
+        return torch.cat([tokens, goal_token], dim=1)
     
     # ========= inference  ============
     def conditional_sample(self, cond=None, gen_attn_map=True, **kwargs):
@@ -103,7 +168,12 @@ class DexGraspVLAController(BaseImagePolicy):
 
         return trajectory, all_timestep_attention_maps
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], output_path: str = None) -> Dict[str, torch.Tensor]:
+    def predict_action(
+            self,
+            obs_dict: Dict[str, torch.Tensor],
+            output_path: str = None,
+            goal_cond: Optional[torch.Tensor] = None,
+        ) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         action_pred: predicted action
@@ -113,9 +183,11 @@ class DexGraspVLAController(BaseImagePolicy):
         # nobs = self.normalizer.normalize(obs_dict)
         nobs = obs_dict
         B = next(iter(nobs.values())).shape[0]
+        self.validate_goal_cond_shape(goal_cond, B)
         
         # process input
         obs_tokens = self.obs_encoder(nobs, training=False)
+        obs_tokens = self.append_goal_token(obs_tokens, goal_cond=goal_cond)
         # (B, N, n_emb)
         
         # run sampling
@@ -182,16 +254,21 @@ class DexGraspVLAController(BaseImagePolicy):
         )
         return optimizer
 
-    def compute_loss(self, batch, training=True):
+    def compute_loss(self, batch, training=True, goal_cond: Optional[torch.Tensor] = None):
         # normalize input
         assert 'valid_mask' not in batch
         # nobs = self.normalizer.normalize(batch['obs'])
         nobs = batch['obs']
+        if goal_cond is None:
+            goal_cond = batch.get('goal_cond', None)
+        B = next(iter(nobs.values())).shape[0]
+        self.validate_goal_cond_shape(goal_cond, B)
         nactions = self.normalizer['action'].normalize(batch['action'])
         trajectory = nactions
 
         # process input
         obs_tokens = self.obs_encoder(nobs, training)
+        obs_tokens = self.append_goal_token(obs_tokens, goal_cond=goal_cond)
         # (B, N, n_emb)
         
         # Sample noise that we'll add to the images
@@ -231,5 +308,5 @@ class DexGraspVLAController(BaseImagePolicy):
 
         return loss
 
-    def forward(self, batch, training=True):
-        return self.compute_loss(batch, training)
+    def forward(self, batch, training=True, goal_cond: Optional[torch.Tensor] = None):
+        return self.compute_loss(batch, training, goal_cond=goal_cond)

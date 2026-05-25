@@ -54,6 +54,10 @@ policy:
   n_head: 8
   p_drop_attn: 0.1
   use_attn_mask: False
+  use_goal_token: True
+  goal_dim: 7
+  goal_token_dim: null
+  goal_mlp_hidden_dim: null
   # start_ckpt_path: data/outputs/2026.04.26/14.43_train_dexgraspvla_controller_grasp/checkpoints/epoch=0123-train_loss=0.002.ckpt
   start_ckpt_path: null
 
