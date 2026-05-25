@@ -74,6 +74,7 @@ class DexGraspVLAController(BaseImagePolicy):
         
         # Pre-grasp auxiliary loss setup
         self.use_pregrasp_delta_aux = use_pregrasp_delta_aux
+        self._aux_loss_batch_count = 0  # For debug logging
         if use_pregrasp_delta_aux:
             # Auxiliary head: pool observation features -> predict delta arm joints
             self.pregrasp_delta_aux_head = torch.nn.Sequential(
@@ -282,6 +283,34 @@ class DexGraspVLAController(BaseImagePolicy):
                 mask_sum = torch.sum(pregrasp_mask)
                 eps = 1e-6
                 aux_loss = torch.sum(pregrasp_mask * mse_per_sample) / (mask_sum + eps)
+                
+                # Debug logging for first few batches
+                if self._aux_loss_batch_count < 3:
+                    action_loss_val = loss.detach().item()
+                    aux_loss_val = aux_loss.detach().item()
+                    lambda_aux = getattr(self, '_lambda_pregrasp_delta_aux', 0.02)
+                    
+                    delta_l2_mean = torch.norm(delta_arm_to_grasp, dim=1).mean().item()
+                    delta_l2_std = torch.norm(delta_arm_to_grasp, dim=1).std().item()
+                    delta_l2_max = torch.norm(delta_arm_to_grasp, dim=1).max().item()
+                    
+                    pred_l2_mean = torch.norm(pred_delta_arm, dim=1).mean().item()
+                    pred_l2_std = torch.norm(pred_delta_arm, dim=1).std().item()
+                    pred_l2_max = torch.norm(pred_delta_arm, dim=1).max().item()
+                    
+                    mask_ratio = mask_sum.item() / B
+                    
+                    print(
+                        f"[AUX_LOSS DEBUG {self._aux_loss_batch_count}] "
+                        f"action_loss={action_loss_val:.6f}, "
+                        f"aux_loss={aux_loss_val:.6f}, "
+                        f"lambda*aux={lambda_aux*aux_loss_val:.6f}, "
+                        f"total_loss={action_loss_val + lambda_aux*aux_loss_val:.6f}; "
+                        f"mask_ratio={mask_ratio:.3f} ({int(mask_sum.item())}/{B}); "
+                        f"delta_l2=[mean={delta_l2_mean:.4f}, std={delta_l2_std:.4f}, max={delta_l2_max:.4f}]; "
+                        f"pred_l2=[mean={pred_l2_mean:.4f}, std={pred_l2_std:.4f}, max={pred_l2_max:.4f}]"
+                    )
+                    self._aux_loss_batch_count += 1
                 
                 # Combine with action loss
                 lambda_pregrasp_delta_aux = getattr(self, '_lambda_pregrasp_delta_aux', 0.02)

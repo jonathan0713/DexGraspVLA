@@ -133,12 +133,14 @@ class MaskImageDataset(BaseImageDataset):
         if self.use_pregrasp_delta_aux:
             right_state = replay_buffer['right_state']  # [T, 8]
             
+            print(f"\n=== Pregrasp Mask Sanity Check for zarr_idx={zarr_idx} ===")
             for episode_idx in range(len(episode_ends)):
                 if episode_idx not in target_arm_joints_dict:
                     continue
                 
                 episode_start = episode_starts[episode_idx]
                 episode_end = episode_ends[episode_idx]
+                episode_length = episode_end - episode_start
                 
                 target_joints = target_arm_joints_dict[episode_idx]  # [6]
                 episode_right_state = right_state[episode_start:episode_end]  # [T, 8]
@@ -152,9 +154,27 @@ class MaskImageDataset(BaseImageDataset):
                 
                 # Find closest frame to target
                 t_grasp = np.argmin(distances)
+                min_dist = distances[t_grasp]
                 
                 # Mark frames <= t_grasp as pregrasp
                 pregrasp_mask[episode_start:episode_start+t_grasp+1] = 1.0
+                
+                # Log sanity check
+                pregrasp_ratio = (t_grasp + 1) / episode_length
+                print(
+                    f"  Episode {episode_idx}: length={episode_length}, "
+                    f"t_grasp={t_grasp}, "
+                    f"pregrasp_ratio={pregrasp_ratio:.2%}, "
+                    f"min_distance_to_target={min_dist:.6f}"
+                )
+                
+                # Warn if t_grasp seems suspicious
+                if t_grasp == 0:
+                    print(f"    ⚠️  WARNING: t_grasp=0 (first frame is closest)")
+                if pregrasp_ratio > 0.9:
+                    print(f"    ⚠️  WARNING: pregrasp phase is >90% of episode (may include lift)")
+                if pregrasp_ratio < 0.05:
+                    print(f"    ⚠️  WARNING: pregrasp phase is <5% of episode (may be too restrictive)")
         
         self.target_arm_joints_per_episode.append(target_arm_joints_dict)
         self.pregrasp_masks.append(pregrasp_mask)
