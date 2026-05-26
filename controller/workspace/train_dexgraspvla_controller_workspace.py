@@ -51,6 +51,10 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
         # Set auxiliary loss weight
         if hasattr(cfg.training, 'lambda_grasp_xy_aux'):
             self.model._lambda_grasp_xy_aux = cfg.training.lambda_grasp_xy_aux
+        if hasattr(cfg.training, 'lambda_pregrasp_joint_delta_aux'):
+            self.model._lambda_pregrasp_joint_delta_aux = (
+                cfg.training.lambda_pregrasp_joint_delta_aux
+            )
 
         self.ema_model: DexGraspVLAController = None
         if cfg.training.use_ema:

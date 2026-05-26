@@ -23,17 +23,30 @@ class MaskImageDataset(BaseImageDataset):
             max_train_episodes=None,
             image_size=(518, 518),
             use_grasp_xy_aux=False,
-            use_pregrasp_delta_aux=False
+            use_pregrasp_delta_aux=False,
+            use_pregrasp_joint_delta_aux=False,
+            pregrasp_aux_max_joint_dist=0.5,
+            pregrasp_aux_min_ratio=0.05,
+            pregrasp_aux_max_ratio=0.8
             ):
         
         super().__init__()
         self.image_size = image_size
         self.use_grasp_xy_aux = use_grasp_xy_aux
         self.use_pregrasp_delta_aux = False
+        self.use_pregrasp_joint_delta_aux = use_pregrasp_joint_delta_aux
+        self.pregrasp_aux_max_joint_dist = float(pregrasp_aux_max_joint_dist)
+        self.pregrasp_aux_min_ratio = float(pregrasp_aux_min_ratio)
+        self.pregrasp_aux_max_ratio = float(pregrasp_aux_max_ratio)
+        if self.use_grasp_xy_aux and self.use_pregrasp_joint_delta_aux:
+            raise ValueError(
+                "Only one auxiliary path can be active: disable use_grasp_xy_aux "
+                "or use_pregrasp_joint_delta_aux."
+            )
         if use_pregrasp_delta_aux:
             print(
                 "Warning: use_pregrasp_delta_aux is deprecated and ignored. "
-                "target_pose['arm_joints'] is not used."
+                "Use use_pregrasp_joint_delta_aux instead."
             )
         
         # Initialize storage lists
@@ -44,6 +57,8 @@ class MaskImageDataset(BaseImageDataset):
         
         # Initialize auxiliary loss data structures
         self.target_grasp_xy_per_episode = []  # List of dicts indexed by zarr_idx and episode_idx
+        self.target_arm_joints_per_episode = []  # List of dicts indexed by zarr_idx and episode_idx
+        self.pregrasp_mask_per_zarr = []  # List of per-frame masks indexed by zarr_idx
         self.frame_to_episode = []  # List of arrays indexed by zarr_idx, mapping frame idx to episode idx
         self.sampler_to_episode_map = []  # Maps sampler idx to (zarr_idx, episode_idx)
         
@@ -99,32 +114,40 @@ class MaskImageDataset(BaseImageDataset):
 
     def _process_target_poses_for_zarr(self, replay_buffer, zarr_idx):
         """
-        Load target poses from meta and extract privileged grasp XY targets.
+        Load target poses from meta and build training-only auxiliary targets.
         """
         target_poses = replay_buffer.meta.get('target_poses', None)
         episode_ends = replay_buffer.episode_ends
         
         # Initialize storage for this zarr
         target_grasp_xy_dict = {}
+        target_arm_joints_dict = {}
         frame_to_episode = np.zeros(len(replay_buffer), dtype=np.int32)
+        pregrasp_mask = np.zeros(len(replay_buffer), dtype=np.float32)
         
-        if target_poses is None or len(target_poses) == 0:
-            # No target poses available
-            self.target_grasp_xy_per_episode.append(target_grasp_xy_dict)
-            self.frame_to_episode.append(frame_to_episode)
-            return
+        if target_poses is None:
+            target_poses = []
         
-        # Build frame_to_episode mapping and extract target grasp XY.
+        # Build frame_to_episode mapping and extract privileged auxiliary targets.
         episode_starts = np.concatenate([[0], episode_ends[:-1]])
+        right_state_all = replay_buffer['right_state']
         
         for episode_idx in range(len(episode_ends)):
-            episode_start = episode_starts[episode_idx]
-            episode_end = episode_ends[episode_idx]
+            episode_start = int(episode_starts[episode_idx])
+            episode_end = int(episode_ends[episode_idx])
+            episode_length = max(episode_end - episode_start, 0)
             
             # Map frames to episode
             frame_to_episode[episode_start:episode_end] = episode_idx
             
-            # Extract target grasp XY from this episode's target pose.
+            target_arm_joints = None
+            t_grasp = -1
+            min_dist = float("inf")
+            pregrasp_ratio = 0.0
+            valid_aux_episode = False
+            invalid_reasons = []
+
+            # Extract targets from this episode's target pose.
             if episode_idx < len(target_poses):
                 target_pose = target_poses[episode_idx]
                 try:
@@ -135,11 +158,70 @@ class MaskImageDataset(BaseImageDataset):
                         if isinstance(cartesian_pose, (list, tuple, np.ndarray)) and len(cartesian_pose) >= 2:
                             grasp_xy = np.array(cartesian_pose[:2], dtype=np.float32)
                             target_grasp_xy_dict[episode_idx] = grasp_xy
+                    if isinstance(target_pose, dict) and 'arm_joints' in target_pose:
+                        raw_arm_joints = target_pose['arm_joints']
+                        if isinstance(raw_arm_joints, (list, tuple, np.ndarray)) and len(raw_arm_joints) >= 6:
+                            target_arm_joints = np.array(raw_arm_joints[:6], dtype=np.float32)
+                            target_arm_joints_dict[episode_idx] = target_arm_joints
                 except Exception as e:
                     print(f"Warning: Failed to parse target_pose for episode {episode_idx}: {e}")
-                    continue
+                    invalid_reasons.append(f"target_pose_parse_failed:{e}")
+            else:
+                invalid_reasons.append("missing_target_pose")
+
+            if target_arm_joints is None:
+                invalid_reasons.append("missing_or_invalid_arm_joints")
+
+            if episode_length <= 0:
+                invalid_reasons.append("empty_episode")
+
+            if self.use_pregrasp_joint_delta_aux and target_arm_joints is not None and episode_length > 0:
+                episode_states = np.asarray(
+                    right_state_all[episode_start:episode_end, :6],
+                    dtype=np.float32,
+                )
+                if episode_states.shape[0] == episode_length and episode_states.shape[1] == 6:
+                    distances = np.linalg.norm(episode_states - target_arm_joints[None, :], axis=1)
+                    t_grasp = int(np.argmin(distances))
+                    min_dist = float(distances[t_grasp])
+                    pregrasp_ratio = float((t_grasp + 1) / episode_length)
+
+                    if min_dist > self.pregrasp_aux_max_joint_dist:
+                        invalid_reasons.append(
+                            f"min_dist>{self.pregrasp_aux_max_joint_dist}"
+                        )
+                    if pregrasp_ratio < self.pregrasp_aux_min_ratio:
+                        invalid_reasons.append(
+                            f"pregrasp_ratio<{self.pregrasp_aux_min_ratio}"
+                        )
+                    if pregrasp_ratio > self.pregrasp_aux_max_ratio:
+                        invalid_reasons.append(
+                            f"pregrasp_ratio>{self.pregrasp_aux_max_ratio}"
+                        )
+
+                    valid_aux_episode = len(invalid_reasons) == 0
+                    if valid_aux_episode:
+                        pregrasp_mask[episode_start:episode_start + t_grasp + 1] = 1.0
+                else:
+                    invalid_reasons.append("right_state_shape_invalid")
+
+            if self.use_pregrasp_joint_delta_aux:
+                reason = "none" if valid_aux_episode else ",".join(invalid_reasons)
+                print(
+                    "[PREGRASP_JOINT_DELTA_AUX DATASET] "
+                    f"zarr_idx={zarr_idx} episode_idx={episode_idx} "
+                    f"target_arm_joints={None if target_arm_joints is None else target_arm_joints.tolist()} "
+                    f"episode_length={episode_length} "
+                    f"t_grasp={t_grasp} "
+                    f"min_dist={min_dist:.6f} "
+                    f"pregrasp_ratio={pregrasp_ratio:.6f} "
+                    f"valid_aux_episode={valid_aux_episode} "
+                    f"invalid_reason={reason}"
+                )
         
         self.target_grasp_xy_per_episode.append(target_grasp_xy_dict)
+        self.target_arm_joints_per_episode.append(target_arm_joints_dict)
+        self.pregrasp_mask_per_zarr.append(pregrasp_mask)
         self.frame_to_episode.append(frame_to_episode)
 
     def get_validation_dataset(self):
@@ -251,6 +333,18 @@ class MaskImageDataset(BaseImageDataset):
             
             data['grasp_xy'] = grasp_xy
             data['grasp_xy_valid'] = np.array(grasp_xy_valid, dtype=np.float32)
+
+        if self.use_pregrasp_joint_delta_aux:
+            episode_idx = int(self.frame_to_episode[zarr_idx][frame_idx])
+            target_arm_joints_dict = self.target_arm_joints_per_episode[zarr_idx]
+            target_arm_joints = target_arm_joints_dict.get(
+                episode_idx,
+                np.zeros(6, dtype=np.float32),
+            ).astype(np.float32)
+            pregrasp_mask = self.pregrasp_mask_per_zarr[zarr_idx][frame_idx]
+
+            data['target_arm_joints'] = target_arm_joints
+            data['pregrasp_mask'] = np.array(pregrasp_mask, dtype=np.float32)
         
         return data
 

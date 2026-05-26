@@ -57,11 +57,14 @@ policy:
   # start_ckpt_path: data/outputs/2026.04.26/14.43_train_dexgraspvla_controller_grasp/checkpoints/epoch=0123-train_loss=0.002.ckpt
   start_ckpt_path: null
 
-  # Training-only grasp XY auxiliary loss config
-  use_grasp_xy_aux: true
+  # Training-only auxiliary loss config. Keep only one auxiliary path active.
+  use_grasp_xy_aux: false
   grasp_xy_aux_dim: 2
   grasp_xy_aux_hidden_dim: 256
   normalize_grasp_xy: true
+  use_pregrasp_joint_delta_aux: true
+  pregrasp_joint_delta_aux_dim: 6
+  pregrasp_joint_delta_aux_hidden_dim: 256
 
 ema:
   _target_: controller.model.diffusion.ema_model.EMAModel
@@ -103,8 +106,12 @@ training:
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: False
-  # auxiliary loss weight
+  # auxiliary loss weights
   lambda_grasp_xy_aux: 0.02
+  lambda_pregrasp_joint_delta_aux: 0.02
+  pregrasp_aux_max_joint_dist: 0.5
+  pregrasp_aux_min_ratio: 0.05
+  pregrasp_aux_max_ratio: 0.8
   # training loop control
   # in epochs
   rollout_every: 10

@@ -41,3 +41,7 @@ dataset:
   seed: 42
   val_ratio: 0
   use_grasp_xy_aux: ${policy.use_grasp_xy_aux}
+  use_pregrasp_joint_delta_aux: ${policy.use_pregrasp_joint_delta_aux}
+  pregrasp_aux_max_joint_dist: ${training.pregrasp_aux_max_joint_dist}
+  pregrasp_aux_min_ratio: ${training.pregrasp_aux_min_ratio}
+  pregrasp_aux_max_ratio: ${training.pregrasp_aux_max_ratio}

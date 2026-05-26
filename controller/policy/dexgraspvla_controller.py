@@ -39,6 +39,9 @@ class DexGraspVLAController(BaseImagePolicy):
             grasp_xy_aux_hidden_dim=256,
             normalize_grasp_xy=True,
             use_pregrasp_delta_aux=False,
+            use_pregrasp_joint_delta_aux=False,
+            pregrasp_joint_delta_aux_dim=6,
+            pregrasp_joint_delta_aux_hidden_dim=256,
             pregrasp_delta_aux_hidden_dim=256,
             # parameters passed to step
             **kwargs):
@@ -81,12 +84,22 @@ class DexGraspVLAController(BaseImagePolicy):
         self.grasp_xy_aux_dim = grasp_xy_aux_dim
         self.normalize_grasp_xy = normalize_grasp_xy
         self.use_pregrasp_delta_aux = False
+        self.use_pregrasp_joint_delta_aux = use_pregrasp_joint_delta_aux
+        self.pregrasp_joint_delta_aux_dim = pregrasp_joint_delta_aux_dim
+        if self.use_pregrasp_joint_delta_aux and self.pregrasp_joint_delta_aux_dim != 6:
+            raise ValueError("pregrasp_joint_delta_aux_dim must be 6 for arm joint deltas.")
+        if self.use_grasp_xy_aux and self.use_pregrasp_joint_delta_aux:
+            raise ValueError(
+                "Only one auxiliary path can be active: disable use_grasp_xy_aux "
+                "or use_pregrasp_joint_delta_aux."
+            )
         self._xy_aux_loss_batch_count = 0  # For debug logging
+        self._pregrasp_joint_delta_aux_loss_batch_count = 0  # For debug logging
         self._current_epoch = 0
         if use_pregrasp_delta_aux:
             print(
                 "Warning: use_pregrasp_delta_aux is deprecated and ignored. "
-                "target_pose['arm_joints'] is not used."
+                "Use use_pregrasp_joint_delta_aux instead."
             )
         if use_grasp_xy_aux:
             # Auxiliary head: pool observation features -> predict grasp workspace XY.
@@ -96,6 +109,19 @@ class DexGraspVLAController(BaseImagePolicy):
                 torch.nn.GELU(),
                 torch.nn.Dropout(0.1),
                 torch.nn.Linear(grasp_xy_aux_hidden_dim, grasp_xy_aux_dim)
+            )
+        if use_pregrasp_joint_delta_aux:
+            # Training-only auxiliary head:
+            # pool observation features -> predict current-arm to grasp-contact joint delta.
+            self.pregrasp_joint_delta_aux_head = torch.nn.Sequential(
+                torch.nn.Linear(n_emb, pregrasp_joint_delta_aux_hidden_dim),
+                torch.nn.LayerNorm(pregrasp_joint_delta_aux_hidden_dim),
+                torch.nn.GELU(),
+                torch.nn.Dropout(0.1),
+                torch.nn.Linear(
+                    pregrasp_joint_delta_aux_hidden_dim,
+                    pregrasp_joint_delta_aux_dim,
+                )
             )
 
         if num_inference_steps is None:
@@ -344,6 +370,81 @@ class DexGraspVLAController(BaseImagePolicy):
 
                 lambda_grasp_xy_aux = getattr(self, '_lambda_grasp_xy_aux', 0.02)
                 loss = loss + lambda_grasp_xy_aux * xy_aux_loss
+
+        # Compute training-only phase-gated pre-grasp joint delta auxiliary loss.
+        if self.use_pregrasp_joint_delta_aux and training:
+            if 'target_arm_joints' in batch and 'pregrasp_mask' in batch:
+                B = obs_tokens.shape[0]
+                device = obs_tokens.device
+
+                obs_summary = torch.mean(obs_tokens, dim=1)  # [B, n_emb]
+                pred_delta_arm = self.pregrasp_joint_delta_aux_head(obs_summary)  # [B, 6]
+
+                target_arm_joints = batch['target_arm_joints'].to(device).float()  # [B, 6]
+                current_arm_joints = batch['obs']['right_state'][:, 0, :6].to(device).float()
+                delta_arm_to_grasp = target_arm_joints - current_arm_joints
+
+                pregrasp_mask = batch['pregrasp_mask'].to(device).float()
+                if pregrasp_mask.dim() > 1:
+                    pregrasp_mask = pregrasp_mask.squeeze(-1)
+
+                mse_per_sample = torch.mean(
+                    (pred_delta_arm - delta_arm_to_grasp) ** 2,
+                    dim=-1,
+                )
+                valid_sum = torch.sum(pregrasp_mask)
+                eps = 1e-6
+                joint_delta_aux_loss = (
+                    torch.sum(pregrasp_mask * mse_per_sample) / (valid_sum + eps)
+                )
+
+                lambda_aux = getattr(self, '_lambda_pregrasp_joint_delta_aux', 0.02)
+
+                if getattr(self, '_current_epoch', 0) == 0 and self._pregrasp_joint_delta_aux_loss_batch_count < 3:
+                    action_loss_val = loss.detach().item()
+                    joint_delta_aux_loss_val = joint_delta_aux_loss.detach().item()
+                    weighted_aux_loss_val = lambda_aux * joint_delta_aux_loss_val
+                    ratio_val = weighted_aux_loss_val / max(action_loss_val, 1e-12)
+
+                    if valid_sum.item() > 0:
+                        valid_bool = pregrasp_mask > 0.5
+                        target_delta_stats_tensor = delta_arm_to_grasp[valid_bool]
+                        pred_delta_stats_tensor = pred_delta_arm[valid_bool]
+                    else:
+                        target_delta_stats_tensor = delta_arm_to_grasp
+                        pred_delta_stats_tensor = pred_delta_arm
+
+                    def stats_str(name, tensor):
+                        tensor = tensor.detach().float()
+                        return (
+                            f"{name}=[mean={tensor.mean(dim=0).cpu().numpy()}, "
+                            f"std={tensor.std(dim=0, unbiased=False).cpu().numpy()}, "
+                            f"min={tensor.min(dim=0).values.cpu().numpy()}, "
+                            f"max={tensor.max(dim=0).values.cpu().numpy()}]"
+                        )
+
+                    def first_values(tensor, count=5):
+                        return tensor[:count].detach().float().cpu().numpy().tolist()
+
+                    print(
+                        f"[PREGRASP_JOINT_DELTA_AUX DEBUG "
+                        f"{self._pregrasp_joint_delta_aux_loss_batch_count}] "
+                        f"epoch={getattr(self, '_current_epoch', 0)}, "
+                        f"action_loss={action_loss_val:.6f}, "
+                        f"joint_delta_aux_loss={joint_delta_aux_loss_val:.6f}, "
+                        f"lambda*joint_delta_aux_loss={weighted_aux_loss_val:.6f}, "
+                        f"ratio={ratio_val:.6f}, "
+                        f"total_loss={action_loss_val + weighted_aux_loss_val:.6f}; "
+                        f"pregrasp_mask.sum()/batch_size={valid_sum.item():.1f}/{B}; "
+                        f"{stats_str('target_delta_arm', target_delta_stats_tensor)}; "
+                        f"{stats_str('pred_delta_arm', pred_delta_stats_tensor)}; "
+                        f"first5_target_arm_joints={first_values(target_arm_joints)}, "
+                        f"first5_current_arm_joints={first_values(current_arm_joints)}, "
+                        f"first5_delta_arm_to_grasp={first_values(delta_arm_to_grasp)}"
+                    )
+                    self._pregrasp_joint_delta_aux_loss_batch_count += 1
+
+                loss = loss + lambda_aux * joint_delta_aux_loss
         
         return loss
 
