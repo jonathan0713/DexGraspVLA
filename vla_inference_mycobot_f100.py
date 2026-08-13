@@ -32,7 +32,8 @@ from mycobot_f100.vla_config_mycobot_f100 import config
 # Defaults target the F100 run whose hydra config has right_state/action shape 8.
 RUN_DIR = os.environ.get(
     "VLA_F100_RUN_DIR",
-    "data/outputs/2026.05.24/22.39_train_dexgraspvla_controller_grasp",
+    # "data/outputs/2026.05.24/22.39_train_dexgraspvla_controller_grasp",
+    "data/outputs/from_itri/special",
 )
 CKPT_NAME = os.environ.get("VLA_F100_CKPT_NAME", "latest.ckpt")
 
@@ -50,12 +51,12 @@ CONTROL_SOCKET_PATH = os.environ.get(
 CAMERA_SOCKET_PATH = os.environ.get("VLA_F100_CAMERA_SOCKET", "/tmp/vla_cam_stream")
 TRACKER_ENDPOINT = os.environ.get("VLA_F100_TRACKER_ENDPOINT", "tcp://127.0.0.1:5555")
 
-SKIP_FIRST_K = int(os.environ.get("VLA_F100_SKIP_FIRST_K", "16"))
+SKIP_FIRST_K = int(os.environ.get("VLA_F100_SKIP_FIRST_K", "8"))
 CHUNK_SIZE = int(os.environ.get("VLA_F100_CHUNK_SIZE", "64"))
 TRIGGER_THRESHOLD = int(os.environ.get("VLA_F100_TRIGGER_THRESHOLD", "12"))
 
 INTERPOLATE_ACTION_DISTANCE = float(os.environ.get("VLA_F100_INTERPOLATE_DISTANCE", "0.015"))
-OUTLIER_ACTION_DISTANCE = float(os.environ.get("VLA_F100_OUTLIER_DISTANCE", "0.1"))
+OUTLIER_ACTION_DISTANCE = float(os.environ.get("VLA_F100_OUTLIER_DISTANCE", "0.06"))
 MAX_INTERPOLATION_STEPS = int(os.environ.get("VLA_F100_MAX_INTERPOLATION_STEPS", "12"))
 
 GRIPPER_JOINT_VALUE_SCALES = {

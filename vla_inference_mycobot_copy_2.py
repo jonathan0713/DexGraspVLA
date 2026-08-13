@@ -48,7 +48,7 @@ RESET_SIGNAL_PATH = os.environ.get("VLA_INFERENCE_RESET_FILE", "/tmp/vla_inferen
 CONTROL_SOCKET_PATH = os.environ.get("VLA_INFERENCE_CONTROL_SOCKET", "/tmp/vla_inference_control.sock")
 
 # 🌟 修正 3：因為頻率變高了，我們把捨棄的步數稍微拉長
-SKIP_FIRST_K = 16
+SKIP_FIRST_K = 28
 CHUNK_SIZE = 64
 # (在 30Hz 下，跳過前 5 步代表跳過 0.16 秒的猶豫期)
 

@@ -1,0 +1,49 @@
+name: grasp
+
+# 設定為 DINOv2 建議的 518x518
+image_shape: [3, 518, 518]
+mask_image_shape: [4, 518, 518]
+
+# 指向你剛剛產出的新 Zarr 路徑
+dataset_paths:
+  # - /home/jonathan/local_data/0423_blackcola_zarr_with_masks_preprocessed
+  - /home/jonathan/local_data/0423_goldencola_zarr_with_masks_preprocessed
+  # - /home/jonathan/local_data/0423_cheezitbox_zarr_with_masks_preprocessed
+
+shape_meta: &shape_meta
+  obs:
+    # 手腕鏡頭 (純 RGB)
+    wrist_rgb:
+      shape: ${task.image_shape}
+      type: rgb
+      horizon: ${n_obs_steps}
+    
+    # 全域鏡頭 (RGB + Mask)
+    global_front_rgbm:
+      shape: ${task.mask_image_shape}
+      type: rgbm
+      horizon: ${n_obs_steps}
+    
+    # 機器人狀態 (對應 Zarr 的 robot_state)
+    robot_state:
+      shape: [13]
+      type: low_dim
+      horizon: ${n_obs_steps}
+      
+  action:
+    # 機器人動作 (對應 Zarr 的 robot_action)
+    shape: [13]
+    horizon: ${n_action_steps}
+
+env_runner:
+  _target_: controller.env_runner.real_grasp_image_runner.RealGraspImageRunner
+
+dataset:
+  _target_: controller.dataset.mask_image_dataset.MaskImageDataset
+  zarr_paths: ${task.dataset_paths}
+  shape_meta: ${shape_meta}
+  horizon: ${n_action_steps}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0

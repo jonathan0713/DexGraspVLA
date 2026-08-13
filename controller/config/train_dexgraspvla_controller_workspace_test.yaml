@@ -1,0 +1,140 @@
+defaults:
+  - _self_
+  - task: grasp
+
+
+name: train_dexgraspvla_controller
+_target_: controller.workspace.train_dexgraspvla_controller_workspace.TrainDexGraspVLAControllerWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+n_action_steps: 32
+n_obs_steps: 1  # we currently do not support multi-step observation
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_cond: True
+
+policy:
+  _target_: controller.policy.dexgraspvla_controller.DexGraspVLAController
+  shape_meta: ${shape_meta}
+  
+  noise_scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 50
+    beta_start: 0.0001
+    beta_end: 0.02
+    # beta_schedule is important
+    # this is the best we found
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon # or sample
+
+  obs_encoder:
+    _target_: controller.model.vision.obs_encoder.ObsEncoder
+    shape_meta: ${shape_meta}
+    model_config:
+      # 這裡的 Key 必須與 grasp.yaml 對應
+      wrist_rgb:
+        model_type: dinov2_vitl14  # 手腕用 Large 提取細節
+        local_weights_path: null
+      global_front_rgbm:
+        model_type: dinov2_vitb14  # 全域用 Base
+        local_weights_path: null
+
+  num_inference_steps: 16
+  n_layer: 12
+  n_head: 8
+  p_drop_attn: 0.1
+  use_attn_mask: False
+  # start_ckpt_path: data/outputs/2026.02.03/03.38_train_dexgraspvla_controller_grasp/checkpoints/epoch=0049-train_loss=0.002.ckpt
+  start_ckpt_path: null
+
+ema:
+  _target_: controller.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 12       # [建議修改] 48 對於 5070 Ti (16GB VRAM) 可能有點極限，建議先從 32 開始
+  num_workers: 4 
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 48
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1e-4
+  betas: [0.95, 0.999]
+  
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  # optimization
+  lr_scheduler: cosine
+  lr_warmup_steps: 2000
+  num_epochs: 125
+  gradient_accumulate_every: 4
+  # EMA destroys performance when used with BatchNorm
+  # replace BatchNorm with GroupNorm.
+  use_ema: False
+  # training loop control
+  # in epochs
+  rollout_every: 10
+  checkpoint_every: 1
+  val_every: 10000
+  sample_every: 10
+  gen_attn_map: True
+  # steps per epoch
+  max_train_steps: null
+  max_val_steps: null
+  # misc
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: train_dexgraspvla_controller
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.4f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${task_name}
+    subdir: ${hydra.job.num}
